@@ -1,182 +1,199 @@
+// ไลบรารีที่จำเป็น
 #include <WiFi.h>
 #include <WiFiManager.h>
+#include <HTTPClient.h>
 #include <Firebase_ESP_Client.h>
-#include <time.h>
 #include "addons/TokenHelper.h"
 #include <PZEM004Tv30.h>
+#include <ArduinoJson.h>
 
-// ตั้งค่า API Key และ URL ของ Firebase Realtime Database
-#define API_KEY ""
-#define DATABASE_URL ""
+// =============== ค่าคงที่สำหรับการตั้งค่า Firebase ===============
+#define DATABASE_URL_API "https://esp32-f1440-default-rtdb.asia-southeast1.firebasedatabase.app/Detected.json"
+#define API_KEY "AIzaSyAZAvntnhQdktxIBKr4KEyyh-8cOmiptH0"
+#define DATABASE_URL "https://esp32-f1440-default-rtdb.asia-southeast1.firebasedatabase.app/"
+#define DEVICE_ID "Smart_Monitor_001"
 
-// กำหนดขา (Pin) สำหรับรีเลย์และบัซเซอร์
-#define RELAY_PIN_1 27
-#define RELAY_PIN_2 26
-#define BUZZER_PIN 23
+// =============== การกำหนดขา GPIO ===============
+// ขาสำหรับรีเลย์และบัซเซอร์
+#define RELAY_PIN_1 27        // รีเลย์ตัวที่ 1
+#define RELAY_PIN_2 26        // รีเลย์ตัวที่ 2
+#define BUZZER_PIN 23        // บัซเซอร์หลัก
+#define ALERT_BUZZER_PIN 21  // บัซเซอร์สำหรับแจ้งเตือน
+#define BOOT_BUTTON_PIN 0    // ปุ่ม BOOT สำหรับรีเซ็ต WiFi
+
+// ขาสำหรับ PZEM-004T
 #define RX_PIN 16
 #define TX_PIN 17
-#define BOOT_BUTTON_PIN 0  // BOOT button pin on ESP32
 
-// กำหนด ID สำหรับอุปกรณ์ ESP32
-#define DEVICE_ID "ESP32_DEVICE_002"
-
-// สร้างออบเจ็กต์สำหรับการเชื่อมต่อ Firebase
+// =============== ตัวแปรสำหรับ Firebase ===============
 FirebaseData fbdo;
 FirebaseAuth auth;
 FirebaseConfig config;
-
-// สร้างออบเจ็กต์สำหรับการวัดแรงดันไฟฟ้า (Voltage)
-PZEM004Tv30 pzem(Serial2, RX_PIN, TX_PIN);
-float voltage;
-
-// ตัวแปรสถานะการเชื่อมต่อ Firebase
 bool signupOK = false;
+
+// =============== ตัวแปรสำหรับการวัดค่าไฟฟ้า ===============
+PZEM004Tv30 pzem(Serial2, RX_PIN, TX_PIN);
+float voltage = 0.0, lastVoltage = -1.0;
+float current = 0.0, lastCurrent = -1.0;
+bool lastLeakageStatus = false;
+
+// =============== ตัวแปรสำหรับการจัดการเวลา ===============
 unsigned long sendDataPrevMillis = 0;
-const long sendDataIntervalMillis = 10000;  // กำหนดช่วงเวลาการส่งข้อมูล (10 วินาที)
+const long sendDataIntervalMillis = 1000;  // ส่งข้อมูลทุก 1 วินาที
 
-// ฟังก์ชันตั้งค่าเวลาจาก NTP Server
+// =============== ฟังก์ชันสำหรับการจัดการเวลา ===============
 void configTimeForNTP() {
-  configTime(7 * 3600, 0, "pool.ntp.org", "time.nist.gov");  // ใช้เขตเวลา GMT+7
+    configTime(7 * 3600, 0, "pool.ntp.org", "time.nist.gov");  // ตั้งค่าเวลาโซน +7 (ประเทศไทย)
 }
 
-// ฟังก์ชันรับเวลาปัจจุบันเป็นข้อความ
-String getCurrentTime() {
-  struct tm timeinfo;
-  if (!getLocalTime(&timeinfo)) {
-    Serial.println("ไม่สามารถดึงเวลาได้");
-    return "";
-  }
-  char timeString[30];
-  strftime(timeString, sizeof(timeString), "%Y-%m-%d %H:%M:%S", &timeinfo);
-  return String(timeString);
+void getCurrentDateTime(String &date, String &time) {
+    struct tm timeinfo;
+    if (!getLocalTime(&timeinfo)) {
+        Serial.println("ไม่สามารถรับข้อมูลเวลาได้");
+        return;
+    }
+    // จัดรูปแบบวันที่และเวลา
+    date = String(timeinfo.tm_year + 1900) + "-" + String(timeinfo.tm_mon + 1) + "-" + String(timeinfo.tm_mday);
+    time = String(timeinfo.tm_hour) + ":" + String(timeinfo.tm_min) + ":" + String(timeinfo.tm_sec);
 }
 
+// =============== ฟังก์ชันตรวจสอบการรีเซ็ต WiFi ===============
+void checkButtonForWiFiReset() {
+    static unsigned long buttonPressStart = 0;
+    static bool buttonHeld = false;
+
+    if (digitalRead(BOOT_BUTTON_PIN) == LOW) {
+        if (!buttonHeld) {
+            buttonPressStart = millis();
+            buttonHeld = true;
+        } else if (millis() - buttonPressStart >= 3000) {  // กดค้าง 3 วินาที
+            Serial.println("กำลังรีเซ็ตการตั้งค่า WiFi...");
+            WiFiManager wifiManager;
+            wifiManager.resetSettings();
+            ESP.restart();
+        }
+    } else {
+        buttonHeld = false;
+    }
+}
+
+// =============== ฟังก์ชัน Setup ===============
 void setup() {
-  Serial.begin(115200);
-  Serial.println("เริ่มต้นโปรแกรม");
+    Serial.begin(115200);
+    Serial.println("เริ่มต้นระบบ...");
 
-  // ตั้งค่าเริ่มต้นให้บัซเซอร์ปิดอยู่
-  pinMode(BUZZER_PIN, OUTPUT);
-  digitalWrite(BUZZER_PIN, HIGH);
+    // ตั้งค่าขา GPIO
+    pinMode(BUZZER_PIN, OUTPUT);
+    pinMode(ALERT_BUZZER_PIN, OUTPUT);
+    pinMode(BOOT_BUTTON_PIN, INPUT);
+    pinMode(RELAY_PIN_1, OUTPUT);
+    pinMode(RELAY_PIN_2, OUTPUT);
 
-  // ตั้งค่า BOOT button pin เป็น input
-  pinMode(BOOT_BUTTON_PIN, INPUT);
+    // ตั้งค่าสถานะเริ่มต้น
+    digitalWrite(BUZZER_PIN, HIGH);
+    digitalWrite(ALERT_BUZZER_PIN, HIGH);
 
-  // เชื่อมต่อ WiFi โดยใช้ WiFiManager
-  WiFiManager wifiManager;
-  wifiManager.autoConnect("ESP32_AP");
-  Serial.println("\nเชื่อมต่อ WiFi สำเร็จ");
+    // เชื่อมต่อ WiFi
+    WiFiManager wifiManager;
+    wifiManager.autoConnect("ESP32_AP");
+    Serial.println("เชื่อมต่อ WiFi สำเร็จ");
 
-  // ตั้งค่าเวลา NTP
-  configTimeForNTP();
+    // ตั้งค่าเวลา
+    configTimeForNTP();
 
-  // ตั้งค่าการเชื่อมต่อ Firebase
-  config.api_key = API_KEY;
-  config.database_url = DATABASE_URL;
-  config.token_status_callback = tokenStatusCallback;
+    // ตั้งค่า Firebase
+    config.api_key = API_KEY;
+    config.database_url = DATABASE_URL;
+    config.token_status_callback = tokenStatusCallback;
 
-  // ลงทะเบียนเข้าสู่ Firebase แบบไม่ระบุตัวตน (Anonymous)
-  if (Firebase.signUp(&config, &auth, "", "")) {
-    Serial.println("ลงทะเบียน Firebase สำเร็จ");
-    signupOK = true;
-  } else {
-    Serial.printf("ลงทะเบียน Firebase ไม่สำเร็จ: %s\n", config.signer.signupError.message.c_str());
-  }
+    // ลงทะเบียน Firebase
+    if (Firebase.signUp(&config, &auth, "", "")) {
+        Serial.println("ลงทะเบียน Firebase สำเร็จ");
+        signupOK = true;
+    } else {
+        Serial.printf("ลงทะเบียน Firebase ไม่สำเร็จ: %s\n", config.signer.signupError.message.c_str());
+    }
 
-  // เริ่มการใช้งาน Firebase
-  Firebase.begin(&config, &auth);
-  Firebase.reconnectWiFi(true);
+    Firebase.begin(&config, &auth);
+    Firebase.reconnectWiFi(true);
 
-  // ส่ง ID ของอุปกรณ์ไปยัง Firebase
-  if (Firebase.RTDB.setString(&fbdo, "/Devices/" DEVICE_ID "/ID", DEVICE_ID)) {
-    Serial.println("ส่ง Device ID สำเร็จ");
-  } else {
-    Serial.printf("ส่ง Device ID ไม่สำเร็จ: %s\n", fbdo.errorReason().c_str());
-  }
-
-  // ตั้งค่า Pin ของรีเลย์
-  pinMode(RELAY_PIN_1, OUTPUT);
-  pinMode(RELAY_PIN_2, OUTPUT);
+    // ส่ง Device ID ไปยัง Firebase
+    if (Firebase.RTDB.setString(&fbdo, "/Devices/" DEVICE_ID "/ID", DEVICE_ID)) {
+        Serial.println("ส่ง Device ID สำเร็จ");
+    } else {
+        Serial.printf("ส่ง Device ID ไม่สำเร็จ: %s\n", fbdo.errorReason().c_str());
+    }
 }
 
-unsigned long voltageCheckPrevMillis = 0;
-const long voltageCheckIntervalMillis = 500;  // กำหนดช่วงเวลาสำหรับการอ่านค่าแรงดันไฟฟ้า (500 ms)
-unsigned long relayControlPrevMillis = 0;
-const long relayControlIntervalMillis = 60000;  // กำหนดช่วงเวลาสำหรับการควบคุมรีเลย์ (60 วินาที)
-
+// =============== ฟังก์ชัน Loop ===============
 void loop() {
-  unsigned long currentMillis = millis();
+    unsigned long currentMillis = millis();
+    
+    // ตรวจสอบปุ่มรีเซ็ต WiFi
+    checkButtonForWiFiReset();
 
-  // ตรวจสอบการกดปุ่ม BOOT เพื่อล้างค่า WiFi
-  if (digitalRead(BOOT_BUTTON_PIN) == LOW) {  // หาก BOOT ปุ่มถูกกด
-    Serial.println("ล้างค่า WiFi...");
-    WiFiManager wifiManager;
-    wifiManager.resetSettings();  // ล้างค่า WiFi ที่บันทึกไว้
-    delay(1000);                  // รอให้การรีเซ็ตเสร็จสิ้น
-    ESP.restart();                // รีสตาร์ท ESP32 เพื่อกลับไปยังโหมดการตั้งค่า WiFi
-  }
-
-  // (ต่อจากนี้เป็นโค้ดเดิมที่ทำงานตามปกติ)
-  // อ่านค่าแรงดันไฟฟ้าเป็นช่วงเวลาที่กำหนด
-  if (currentMillis - voltageCheckPrevMillis >= voltageCheckIntervalMillis) {
-    voltageCheckPrevMillis = currentMillis;
+    // อ่านค่าไฟฟ้า
     voltage = pzem.voltage();
-    Serial.print("แรงดันไฟฟ้า: ");
-    Serial.print(voltage);
-    Serial.println(" V");
-  }
+    current = pzem.current();
 
-  // ตรวจสอบและควบคุมรีเลย์และบัซเซอร์ตามสถานะแรงดันไฟฟ้า
-  if (voltage >= 80.0) {
-    digitalWrite(RELAY_PIN_2, HIGH);  // เปิดรีเลย์ 2 เมื่อแรงดันเกิน 80V
-    digitalWrite(BUZZER_PIN, LOW);    // เปิดบัซเซอร์เมื่อแรงดันสูง
-    delay(500);                       // หน่วงเวลาสำหรับบัซเซอร์
-    digitalWrite(BUZZER_PIN, HIGH);
-    digitalWrite(RELAY_PIN_1, LOW);  // ปิดรีเลย์ 1
+    // ตรวจสอบค่าที่วัดได้
+    if (isnan(voltage) || voltage <= 0) voltage = 0.0;
+    if (isnan(current) || current <= 0) current = 0.0;
 
-    // ส่งข้อมูลกระแสรั่วไหลและเวลาไปยัง Firebase เมื่อครบช่วงเวลา
-    if (Firebase.ready() && signupOK && (currentMillis - sendDataPrevMillis > sendDataIntervalMillis || sendDataPrevMillis == 0)) {
-      sendDataPrevMillis = currentMillis;
-      String currentTime = getCurrentTime();
+    // ตรวจสอบสถานะการรั่วไหล
+    bool leakageStatus = (voltage >= 80.0 || current >= 5.0);
 
-      if (Firebase.RTDB.setFloat(&fbdo, "/Devices/" DEVICE_ID "/Data/leakageCurrent", 1)) {
-        Serial.println("ส่งข้อมูลกระแสรั่วไหลสำเร็จ");
-      } else {
-        Serial.printf("ส่งข้อมูลกระแสรั่วไหลไม่สำเร็จ: %s\n", fbdo.errorReason().c_str());
-      }
+    // ควบคุมรีเลย์
+    digitalWrite(RELAY_PIN_2, leakageStatus ? HIGH : LOW);
+    digitalWrite(RELAY_PIN_1, leakageStatus ? LOW : HIGH);
 
-      if (Firebase.RTDB.setString(&fbdo, "/Devices/" DEVICE_ID "/Data/Timestamp", currentTime)) {
-        Serial.println("ส่งข้อมูลเวลา Timestamp สำเร็จ");
-      } else {
-        Serial.printf("ส่งข้อมูลเวลา Timestamp ไม่สำเร็จ: %s\n", fbdo.errorReason().c_str());
-      }
+    // ส่งข้อมูลไปยัง Firebase
+    if (Firebase.ready() && signupOK && (currentMillis - sendDataPrevMillis >= sendDataIntervalMillis)) {
+        sendDataPrevMillis = currentMillis;
+        
+        // รับข้อมูลวันที่และเวลา
+        String date, time;
+        getCurrentDateTime(date, time);
+
+        // ส่งข้อมูลไปยัง Firebase
+        Firebase.RTDB.setString(&fbdo, "/Devices/" DEVICE_ID "/Data/Date", date);
+        Firebase.RTDB.setString(&fbdo, "/Devices/" DEVICE_ID "/Data/Time", time);
+        Firebase.RTDB.setFloat(&fbdo, "/Devices/" DEVICE_ID "/Data/leakageCurrent", leakageStatus ? 1 : 0);
+        Firebase.RTDB.setFloat(&fbdo, "/Devices/" DEVICE_ID "/Data/Voltage", voltage);
+        Firebase.RTDB.setFloat(&fbdo, "/Devices/" DEVICE_ID "/Data/Current", current);
     }
-  } else {
-    digitalWrite(RELAY_PIN_1, HIGH);  // เปิดรีเลย์ 1 เมื่อแรงดันต่ำกว่า 80V
-    digitalWrite(BUZZER_PIN, HIGH);   // ปิดบัซเซอร์เมื่อแรงดันต่ำ
-    digitalWrite(RELAY_PIN_2, LOW);   // ปิดรีเลย์ 2
 
-    // ส่งข้อมูลกระแสรั่วไหลและเวลาไปยัง Firebase เมื่อครบช่วงเวลา
-    if (Firebase.ready() && signupOK && (currentMillis - sendDataPrevMillis > sendDataIntervalMillis || sendDataPrevMillis == 0)) {
-      sendDataPrevMillis = currentMillis;
-      String currentTime = getCurrentTime();
+    // ตรวจสอบข้อมูลจาก Firebase
+    HTTPClient http;
+    http.begin(DATABASE_URL_API);
+    int httpCode = http.GET();
 
-      if (Firebase.RTDB.setFloat(&fbdo, "/Devices/" DEVICE_ID "/Data/leakageCurrent", 0)) {
-        Serial.println("ส่งข้อมูลกระแสรั่วไหลสำเร็จ");
-      } else {
-        Serial.printf("ส่งข้อมูลกระแสรั่วไหลไม่สำเร็จ: %s\n", fbdo.errorReason().c_str());
-      }
+    if (httpCode > 0) {
+        String payload = http.getString();
+        Serial.println("อ่านข้อมูลจาก Firebase สำเร็จ");
 
-      if (Firebase.RTDB.setString(&fbdo, "/Devices/" DEVICE_ID "/Data/Timestamp", currentTime)) {
-        Serial.println("ส่งข้อมูลเวลา Timestamp สำเร็จ");
-      } else {
-        Serial.printf("ส่งข้อมูลเวลา Timestamp ไม่สำเร็จ: %s\n", fbdo.errorReason().c_str());
-      }
+        // แปลงข้อมูล JSON
+        DynamicJsonDocument doc(1024);
+        deserializeJson(doc, payload);
+        int personDetected = doc["person_detected"];
+
+        // ควบคุมบัซเซอร์เมื่อตรวจพบคนและมีไฟฟ้ารั่ว
+        if (personDetected == 1 && leakageStatus) {
+            digitalWrite(BUZZER_PIN, LOW);
+            digitalWrite(ALERT_BUZZER_PIN, LOW);
+        } else {
+            digitalWrite(BUZZER_PIN, HIGH);
+            digitalWrite(ALERT_BUZZER_PIN, HIGH);
+        }
+    } else {
+        Serial.printf("ไม่สามารถรับข้อมูลจาก Firebase: %s\n", http.errorToString(httpCode).c_str());
     }
-  }
 
-  // หน่วงเวลา 30 วินาที (กรณีที่คุณต้องการ)
-  if (currentMillis - relayControlPrevMillis >= relayControlIntervalMillis) {
-    relayControlPrevMillis = currentMillis;
-  }
+    http.end();
+
+    // แสดงข้อมูลที่ Serial Monitor
+    Serial.printf("แรงดันไฟฟ้า: %.2f V, กระแสไฟฟ้า: %.2f A, สถานะการรั่ว: %s\n", 
+                  voltage, current, leakageStatus ? "มีการรั่วไหล" : "ปกติ");
+
+    delay(500);
 }
