@@ -8,9 +8,9 @@
 #include <ArduinoJson.h>
 
 // =============== ค่าคงที่สำหรับการตั้งค่า Firebase ===============
-#define DATABASE_URL_API "https://esp32-f1440-default-rtdb.asia-southeast1.firebasedatabase.app/Detected.json"
-#define API_KEY "AIzaSyAZAvntnhQdktxIBKr4KEyyh-8cOmiptH0"
-#define DATABASE_URL "https://esp32-f1440-default-rtdb.asia-southeast1.firebasedatabase.app/"
+#define DATABASE_URL_API ""
+#define API_KEY ""
+#define DATABASE_URL ""
 #define DEVICE_ID "Smart_Monitor_001"
 
 // =============== การกำหนดขา GPIO ===============
